@@ -1,0 +1,12 @@
+build
+obj_dir
+.env
+.vscode
+*.pyc
+*.vcd
+quartus/db
+quartus/incremental_db
+__pycache__
+generated
+quartus
+output
