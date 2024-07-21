@@ -4,7 +4,7 @@
 .PRECIOUS: generated/%.sv
 
 #--trace-depth 2 
-VERILATOR_CMD := verilator --cc --exe --trace --build -j 0 \
+VERILATOR_CMD := verilator --cc --exe --trace --build -j 0 --debug \
 -Wall --Mdir ./obj_dir -Wno-ENUMVALUE -Wno-WIDTHEXPAND -Wno-ALWCOMBORDER -Wno-UNOPTFLAT -Wno-UNUSED -y ip
 
 csv_sources := $(wildcard test/*_tb_csv.cpp)

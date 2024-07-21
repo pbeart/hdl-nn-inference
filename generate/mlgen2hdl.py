@@ -3,6 +3,7 @@ import mlgen
 import fp as fp
 import hdlgen
 import argparse, os
+import pathlib
 
 from dataclasses import dataclass
 
@@ -62,6 +63,7 @@ module.AddAssignment(output_array, hdlgen.Concatenation(output_layer))
 
 #__import__("code").interact(local=locals())
 
+pathlib.Path(args.destination).parent.mkdir(parents=True, exist_ok=True)
 
 with open(args.destination, "w") as sv_output:
     sv_output.write(module.hdl())
