@@ -8,9 +8,10 @@ from dataclasses import dataclass
 
 parser = argparse.ArgumentParser(description="Simulate the given mlgen model")
 parser.add_argument("model", help="the input .mlgen array")
-parser.add_argument("--incremental-log-layers", "-inc", action="store_true")
+parser.add_argument("--incremental-log-layers", "-inc", action="store_true", help="Simulate feeding inputs into the model incrementally, showing model output at each value")
 parser.add_argument("--simulate-intervals", "-int", action="store_true")
 parser.add_argument("--artificial-interval", "-aint", type=float, default=0.0, help="Introduce artificial interval to network inputs of +/- this number")
+
 #parser.add_argument("input", help="comma-separated list of inputs")
 
 
@@ -22,7 +23,6 @@ f = open(args.model, "rb")
 mlgen_model: mlgen.Model = pickle.load(f)
 f.close()
 
-#last_layer = [float(x) for x in args.input.split(",")]
 
 
 num_logweight_steps = 1
@@ -51,7 +51,7 @@ while True:
     reached_max_steps = False
     
     for layer_index, layer in enumerate(mlgen_model.layers):
-        if isinstance(layer, mlgen.IncrementalLogLayer):
+        if isinstance(layer, mlgen.WeightIncrementalLogLayer):
             if args.incremental_log_layers:
                 reached_max_steps = reached_max_steps or layer.set_steps(num_logweight_steps)
             else:

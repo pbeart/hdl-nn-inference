@@ -151,6 +151,7 @@ class SequentialStepHDL:
         raise NotImplementedError(
             "For a monotonic layer, inherit from Monotoni cStep for an implementation"
         )
+    
 
 
 class MonotonicStep(SequentialStepHDL):
@@ -228,6 +229,41 @@ class BiasStep(MonotonicStep, SequentialStepHDL):
         return [x + bias for (x, bias) in zip(vector_in, self.biases, strict=True)]
 
 
+class DenseLayer(MonotonicStep, SequentialStepHDL):
+    def __init__(self, weights: list[list[float]]):
+        self.weights = weights
+
+    def eval_interval(
+        self, intervals_vector_in: list[tuple[float, float]]
+    ) -> list[tuple[float, float]]:
+        """For each output, determine the interval bound: the minimum
+        will be the sum of the most-negative-possible contributions, and
+        the maximum will be the sum of the most-positive-possible
+        contributions from each input in the output's column"""
+
+        intervals = []
+
+        for weight_row in self.weights:
+            # Find most negative/most positive possible contributions to this output neuron
+            min_sum = 0
+            max_sum = 0
+            for weight, (interval_lower, interval_higher) in zip(
+                weight_row, intervals_vector_in, strict=True
+            ):
+                max_sum += weight * (interval_higher if weight > 0 else interval_lower)
+                min_sum += weight * (interval_lower if weight > 0 else interval_higher)
+
+            intervals.append((min_sum, max_sum))
+
+        return intervals
+
+    def eval(self, vector_in):
+        return [
+            sum(x * weight for weight, x in zip(neuron_weights, vector_in, strict=True))
+            for neuron_weights in self.weights
+        ]
+
+
 class DenseLogLayer(SequentialStepHDL):
     def __init__(self, weight_fragments: list[list[list[WeightFragment]]]):
         self.weight_fragments = weight_fragments
@@ -298,9 +334,10 @@ class DenseLogLayer(SequentialStepHDL):
         ]
 
 
-class IncrementalLogLayer(DenseLogLayer):
+class WeightIncrementalLogLayer(DenseLogLayer):
     """Doesnt actually incrementally compute accumulated values, just computes outputs
     in one go upon eval() for flexibility"""
+    "also kind of useless, why would you want to slowly load inputs in full then drip-feed weight fragments??"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -309,7 +346,6 @@ class IncrementalLogLayer(DenseLogLayer):
             (max((len(y) for y in x), default=0) for x in self.weight_fragments),
             default=0,
         )
-        print(f"Getting max weight count of {self.max_num_weights}")
         self.use_num_weights = 1
 
     def apply(self, *args, **kwargs):
@@ -386,40 +422,91 @@ class IncrementalLogLayer(DenseLogLayer):
             for this_output_log_weights_signs in self.weight_fragments
         ]
 
+class InputIncrementalLogLayer(DenseLayer):
+    """Doesnt actually incrementally compute accumulated values, just computes outputs
+    in one go upon eval() for flexibility"""
 
-class DenseLayer(MonotonicStep, SequentialStepHDL):
-    def __init__(self, weights: list[list[float]]):
-        self.weights = weights
+    "Simulates a layer in which input log-fragments are fed incrementally, with weights stationary"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def apply(self, *args, **kwargs):
+        raise NotImplementedError()
+
+    def set_steps(self, steps: list[int]):
+        self.use_num_weights = steps
+        return None
 
     def eval_interval(
         self, intervals_vector_in: list[tuple[float, float]]
     ) -> list[tuple[float, float]]:
-        """For each output, determine the interval bound: the minimum
-        will be the sum of the most-negative-possible contributions, and
-        the maximum will be the sum of the most-positive-possible
-        contributions from each input in the output's column"""
+        """Works by finding the current output interval using only the weight-fragments
+        being used so far (use_num_weights) plus maximum positive or negative deviation,
+        whose absolute value is given by the sum of all possible remaining weight-
+        fragments"""
 
         intervals = []
 
-        for weight_row in self.weights:
+        for weight_fragments_row in self.weights:
             # Find most negative/most positive possible contributions to this output neuron
-            min_sum = 0
-            max_sum = 0
-            for weight, (interval_lower, interval_higher) in zip(
-                weight_row, intervals_vector_in, strict=True
+            min_sum = 0.0
+            max_sum = 0.0
+            for weight_fragments, (interval_lower, interval_higher) in zip(
+                weight_fragments_row, intervals_vector_in, strict=True
             ):
-                max_sum += weight * (interval_higher if weight > 0 else interval_lower)
-                min_sum += weight * (interval_lower if weight > 0 else interval_higher)
+                current_weight = sum(
+                    (-1.0 if negative else 1.0) * math.pow(2, weight)
+                    for (index, (weight, negative)) in enumerate(weight_fragments)
+                    if index < self.use_num_weights
+                )
+
+                """Max contribution from unprocessed (as yet "unknown") fragments is
+                + or - sum of all powers of 2 less than the smallest current used power:
+                this is equal to the magnitude of the smallest current used power"""
+                
+                unused_fragments_contrib = (
+                    math.pow(2, weight_fragments[self.use_num_weights-1].exponent)
+                ) if (self.use_num_weights > 0) and (self.use_num_weights <= len(weight_fragments)) else 0.0
+
+                max_sum += (
+                    current_weight
+                    + (
+                        unused_fragments_contrib
+                        if interval_higher > 0
+                        else -unused_fragments_contrib
+                    )
+                ) * interval_higher
+                min_sum += (
+                    current_weight
+                    + (
+                        -unused_fragments_contrib
+                        if interval_lower > 0
+                        else unused_fragments_contrib
+
+                    )
+                ) * interval_lower
 
             intervals.append((min_sum, max_sum))
 
         return intervals
 
-    def eval(self, vector_in):
+    def eval(self, vector_in) -> list[float]:
         return [
-            sum(x * weight for weight, x in zip(neuron_weights, vector_in, strict=True))
-            for neuron_weights in self.weights
+            sum(
+                sum(
+                    (-1.0 if negative else 1.0) * x * math.pow(2, weight)
+                    for (index, (weight, negative)) in enumerate(weight_fragments)
+                    if index < self.use_num_weights
+                )
+                for weight_fragments, x in zip(
+                    this_output_log_weights_signs, vector_in, strict=True
+                )
+            )
+            for this_output_log_weights_signs in self.weight_fragments
         ]
+
+
 
 
 @dataclass
