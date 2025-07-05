@@ -1,3 +1,4 @@
+import abc
 from dataclasses import dataclass
 from typing import Optional, NamedTuple
 import warnings
@@ -8,11 +9,29 @@ import fp as fp
 
 import hdlgen
 
+def dot(a,b):
+    "Probably a bad sign that I had to write this, should be using numpy"
+    return sum(x*y for x,y in zip(a,b, strict=True))
 
 class WeightFragment(NamedTuple):
     exponent: int
     negative: bool
 
+class AffineConstraintND(NamedTuple):
+    """Represent an N-dimensional affine constraint of form ax + by + cz + ... <= constant
+    where a, b, c... are members of direction"""
+    direction: list[float]
+    constant: float
+
+    def transform(self, matrix):
+        return AffineConstraintND(
+            [sum(x * y for x, y in zip(row, self.direction, strict=True)) for row in matrix],
+            self.constant,
+        )
+    
+    def satisfies(self, point):
+        assert len(point) == len(self.direction)
+        return sum(x * y for x, y in zip(point, self.direction, strict=True)) <= self.constant
 
 def make_tree_adder(float_environment, on_module, summing_wires, out_wire, width):
     if len(summing_wires) == 0:
@@ -130,7 +149,11 @@ def sort_tuple(tup: tuple[float, float]) -> tuple[float, float]:
         return (tup[0], tup[1])
 
 
-class SequentialStepHDL:
+
+class MLStep:
+    def __init__(self):
+        pass
+
 
     def apply(
         self,
@@ -143,35 +166,44 @@ class SequentialStepHDL:
     def eval(self, vector_in: list[float]):
         raise NotImplementedError()
 
-    def eval_interval(
-        self, intervals_vector_in: list[tuple[float, float]]
+    @abc.abstractmethod
+    def eval_axishyperbox_domain(
+        self, intervals_vector_in: list[tuple[float, float]], ignore_layer_loss=False
     ) -> list[tuple[float, float]]:
         """Return a lower and upper bound on layer output, given the lower and upper bound layer
         inputs."""
         raise NotImplementedError(
-            "For a monotonic layer, inherit from Monotoni cStep for an implementation"
+            "For a monotonic layer, inherit from MonotonicStep for an implementation"
         )
     
+    @abc.abstractmethod
+    def eval_polytope_domain(
+        self, polytope: list[AffineConstraintND], ignore_layer_loss=False
+    ):
+        """Return an updated polytope (list of planar constraints) after transformation
+        of the given polytope constraints by this layer"""
 
+        raise NotImplementedError()
 
-class MonotonicStep(SequentialStepHDL):
-    def eval_interval(
-        self, intervals_vector_in: list[tuple[float, float]]
+class LosslessMonotonicStep(MLStep):
+    def eval_axishyperbox_domain(
+        self, intervals_vector_in: list[tuple[float, float]], ignore_layer_loss=False
     ) -> list[tuple[float, float]]:
         """This implementation returns an interval of vectors based on the "actual"
         output of the layer against the two bounds layer inputs. This may not be appropriate for
-        non-monotonic layers."""
+        non-monotonic, non-lossless layers."""
+
         lower_bounds = self.eval([t[0] for t in intervals_vector_in])
         upper_bounds = self.eval([t[1] for t in intervals_vector_in])
 
         return [sort_tuple((x, y)) for x, y in zip(lower_bounds, upper_bounds)]
 
 
-class ActivationStep(SequentialStepHDL):
+class ActivationStep(MLStep):
     pass
 
 
-class ReLUStep(MonotonicStep, ActivationStep):
+class ReLUStep(LosslessMonotonicStep, ActivationStep):
     def apply(
         self,
         previous_neuron_buses,
@@ -196,10 +228,14 @@ class ReLUStep(MonotonicStep, ActivationStep):
     def eval(self, vector_in):
         return [x if x > 0 else 0 for x in vector_in]
 
+    def eval_polytope_domain(self, polytope: list[AffineConstraintND], ignore_layer_loss=False):
+        # Append the constraint that the output > 0 in every dimension (i.e. -1x + -1y + -1z ... <= 0)
+        return polytope + [AffineConstraintND([-1] * len(polytope[0].direction), 0)]
 
-class BiasStep(MonotonicStep, SequentialStepHDL):
+class BiasStep(LosslessMonotonicStep, MLStep):
     def __init__(self, biases: list[int]):
         self.biases = biases
+        super().__init__()
 
     def apply(
         self,
@@ -228,13 +264,18 @@ class BiasStep(MonotonicStep, SequentialStepHDL):
     def eval(self, vector_in):
         return [x + bias for (x, bias) in zip(vector_in, self.biases, strict=True)]
 
+    def eval_polytope_domain(self, polytope: list[AffineConstraintND], ignore_layer_loss=False):
+        # Evaluate by shifting each constraint, shift constant by (layer bias .dot. polytope direction)
+        return [AffineConstraintND(direction, constant + dot(direction, self.biases)) for direction, constant in polytope]
 
-class DenseLayer(MonotonicStep, SequentialStepHDL):
+
+class FullyConnectedLayer(LosslessMonotonicStep, MLStep):
     def __init__(self, weights: list[list[float]]):
         self.weights = weights
+        super().__init__()
 
-    def eval_interval(
-        self, intervals_vector_in: list[tuple[float, float]]
+    def eval_axishyperbox_domain(
+        self, intervals_vector_in: list[tuple[float, float]], ignore_layer_loss=False
     ) -> list[tuple[float, float]]:
         """For each output, determine the interval bound: the minimum
         will be the sum of the most-negative-possible contributions, and
@@ -256,17 +297,25 @@ class DenseLayer(MonotonicStep, SequentialStepHDL):
             intervals.append((min_sum, max_sum))
 
         return intervals
+    
+    def eval_polytope_domain(self, polytope: list[AffineConstraintND], ignore_layer_loss=False):
+        if not ignore_layer_loss:
+            raise NotImplementedError(f"{self.__class__.__name__}: Can't evaluate polytope domain and calculate incremental error, i.e. requires ignore_layer_loss=True")
+        return [constraint.transform(self.weights) for constraint in polytope]
 
     def eval(self, vector_in):
         return [
             sum(x * weight for weight, x in zip(neuron_weights, vector_in, strict=True))
             for neuron_weights in self.weights
         ]
+    
 
 
-class DenseLogLayer(SequentialStepHDL):
+
+class FullyConnectedLogLayer(MLStep):
     def __init__(self, weight_fragments: list[list[list[WeightFragment]]]):
         self.weight_fragments = weight_fragments
+        super().__init__()
 
     def apply(
         self,
@@ -333,8 +382,9 @@ class DenseLogLayer(SequentialStepHDL):
             for this_output_log_weights_signs in self.weight_fragments
         ]
 
+    
 
-class WeightIncrementalLogLayer(DenseLogLayer):
+class WeightIncrementalLogLayer(FullyConnectedLogLayer):
     """Doesnt actually incrementally compute accumulated values, just computes outputs
     in one go upon eval() for flexibility"""
     "also kind of useless, why would you want to slowly load inputs in full then drip-feed weight fragments??"
@@ -355,8 +405,8 @@ class WeightIncrementalLogLayer(DenseLogLayer):
         self.use_num_weights = steps
         return self.use_num_weights == self.max_num_weights
 
-    def eval_interval(
-        self, intervals_vector_in: list[tuple[float, float]]
+    def eval_axishyperbox_domain(
+        self, intervals_vector_in: list[tuple[float, float]], ignore_layer_loss=False
     ) -> list[tuple[float, float]]:
         """Works by finding the current output interval using only the weight-fragments
         being used so far (use_num_weights) plus maximum positive or negative deviation,
@@ -382,9 +432,13 @@ class WeightIncrementalLogLayer(DenseLogLayer):
                 + or - sum of all powers of 2 less than the smallest current used power:
                 this is equal to the magnitude of the smallest current used power"""
                 
-                unused_fragments_contrib = (
-                    math.pow(2, weight_fragments[self.use_num_weights-1].exponent)
-                ) if (self.use_num_weights > 0) and (self.use_num_weights <= len(weight_fragments)) else 0.0
+                if ignore_layer_loss:
+                    unused_fragments_contrib = 0
+                    # In lossless mode, unused fragments don't contribute
+                else:
+                    unused_fragments_contrib = (
+                        math.pow(2, weight_fragments[self.use_num_weights-1].exponent)
+                    ) if (self.use_num_weights > 0) and (self.use_num_weights <= len(weight_fragments)) else 0.0
 
                 max_sum += (
                     current_weight
@@ -407,110 +461,55 @@ class WeightIncrementalLogLayer(DenseLogLayer):
 
         return intervals
 
-    def eval(self, vector_in) -> list[float]:
+    def eval(self, vector_in, ignore_layer_loss=False) -> list[float]:
+        weights = self.render_weights()
+
         return [
             sum(
-                sum(
-                    (-1.0 if negative else 1.0) * x * math.pow(2, weight)
-                    for (index, (weight, negative)) in enumerate(weight_fragments)
-                    if index < self.use_num_weights
-                )
-                for weight_fragments, x in zip(
-                    this_output_log_weights_signs, vector_in, strict=True
+                x * weight
+                for weight, x in zip(
+                    output_weights, vector_in, strict=True
                 )
             )
-            for this_output_log_weights_signs in self.weight_fragments
+            for output_weights in weights
         ]
 
-class InputIncrementalLogLayer(DenseLayer):
-    """Doesnt actually incrementally compute accumulated values, just computes outputs
-    in one go upon eval() for flexibility"""
-
-    "Simulates a layer in which input log-fragments are fed incrementally, with weights stationary"
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def apply(self, *args, **kwargs):
-        raise NotImplementedError()
-
-    def set_steps(self, steps: list[int]):
-        self.use_num_weights = steps
-        return None
-
-    def eval_interval(
-        self, intervals_vector_in: list[tuple[float, float]]
-    ) -> list[tuple[float, float]]:
-        """Works by finding the current output interval using only the weight-fragments
-        being used so far (use_num_weights) plus maximum positive or negative deviation,
-        whose absolute value is given by the sum of all possible remaining weight-
-        fragments"""
-
-        intervals = []
-
-        for weight_fragments_row in self.weights:
-            # Find most negative/most positive possible contributions to this output neuron
-            min_sum = 0.0
-            max_sum = 0.0
-            for weight_fragments, (interval_lower, interval_higher) in zip(
-                weight_fragments_row, intervals_vector_in, strict=True
-            ):
-                current_weight = sum(
+    def render_weights(self):
+        return [
+            [
+                sum(
                     (-1.0 if negative else 1.0) * math.pow(2, weight)
                     for (index, (weight, negative)) in enumerate(weight_fragments)
                     if index < self.use_num_weights
                 )
-
-                """Max contribution from unprocessed (as yet "unknown") fragments is
-                + or - sum of all powers of 2 less than the smallest current used power:
-                this is equal to the magnitude of the smallest current used power"""
-                
-                unused_fragments_contrib = (
-                    math.pow(2, weight_fragments[self.use_num_weights-1].exponent)
-                ) if (self.use_num_weights > 0) and (self.use_num_weights <= len(weight_fragments)) else 0.0
-
-                max_sum += (
-                    current_weight
-                    + (
-                        unused_fragments_contrib
-                        if interval_higher > 0
-                        else -unused_fragments_contrib
-                    )
-                ) * interval_higher
-                min_sum += (
-                    current_weight
-                    + (
-                        -unused_fragments_contrib
-                        if interval_lower > 0
-                        else unused_fragments_contrib
-
-                    )
-                ) * interval_lower
-
-            intervals.append((min_sum, max_sum))
-
-        return intervals
-
-    def eval(self, vector_in) -> list[float]:
-        return [
-            sum(
-                sum(
-                    (-1.0 if negative else 1.0) * x * math.pow(2, weight)
-                    for (index, (weight, negative)) in enumerate(weight_fragments)
-                    if index < self.use_num_weights
-                )
-                for weight_fragments, x in zip(
-                    this_output_log_weights_signs, vector_in, strict=True
-                )
-            )
+                for weight_fragments in this_output_log_weights_signs
+            ]
             for this_output_log_weights_signs in self.weight_fragments
         ]
 
+    def eval_polytope_domain(self, polytope: list[AffineConstraintND], ignore_layer_loss=False):
+        # Danger: does not 'worsen' bounds to deal with internal uncertainty!
+        if not ignore_layer_loss:
+            raise NotImplementedError(f"{self.__class__.__name__}: Can't evaluate polytope domain and calculate incremental error, i.e. requires ignore_layer_loss=True")
 
+        return [constraint.transform(self.render_weights()) for constraint in polytope]
 
+class FixedWeightIncrementalLogLayer(WeightIncrementalLogLayer):
+    "A WeightIncrementalLogLayer fixed at a certain number of steps"
+    def __init__(self, fixed_number, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.set_steps(fixed_number)
+
+    def __repr__(self):
+        orig = super().__repr__()
+        # remove trailing >, add our own stuff
+        return orig[:-1] + f", with {self.use_num_weights} steps>"
+
+    def set_steps(self, steps):
+        return True
 
 @dataclass
 class Model:
-    layers: list[SequentialStepHDL]
+    layers: list[MLStep]
     input_count: int
     output_count: int

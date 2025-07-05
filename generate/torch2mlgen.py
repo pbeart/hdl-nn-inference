@@ -4,77 +4,9 @@ import argparse
 import pickle
 import warnings
 
-from mlgen import DenseLogLayer, ReLUStep, Model, BiasStep, DenseLayer, WeightIncrementalLogLayer, WeightFragment
-
+from mlgen import FullyConnectedLogLayer, ReLUStep, Model, BiasStep, FullyConnectedLayer, WeightIncrementalLogLayer, WeightFragment
+from conversionutils import identify_layer, convert_layer
 from litob import litob_converter
-
-def identify_layer(layer):
-    if isinstance(layer, torch.jit.ScriptModule):
-        return layer.original_name
-    else:
-        if isinstance(layer, torch.nn.Linear):
-            return "Linear"
-        else:
-            raise NotImplementedError(f"Don't know how to deal with {layer}")
-        
-def convert_layer(layer, log_quantize=False, log_incremental = False, log_quantize_precision: float = 0.1, one_bit=False):
-
-    if len([opt for opt in [log_quantize, log_incremental, one_bit] if opt]) > 1:
-        raise ValueError("Can only specify one option flag!")
-    
-    name = identify_layer(layer)
-    layers = []
-    if name == "Linear":
-        input_count = len(layer.state_dict()["weight"][0])
-
-        if log_incremental:
-            print("Making incremental log layer...")
-            layers.append(WeightIncrementalLogLayer(make_log_mult_layer(layer.state_dict()["weight"], log_quantize_precision)))
-        else:
-            if log_quantize:
-                print("Making log-quantized layer")
-                layers.append(DenseLogLayer(make_log_mult_layer(layer.state_dict()["weight"], log_quantize_precision)))
-            else:
-                print("Making FullyConnected layer")
-                layers.append(DenseLayer(layer.state_dict()["weight"]))
-        
-        layers.append(BiasStep(layer.state_dict()["bias"]))
-        
-        return layers
-    else:
-        raise NotImplementedError(f"Don't know how to convert {layer}")
-
-
-def make_log_mult_layer(weights: list[list[float]], precision: float) -> list[list[list[WeightFragment]]]:
-    print("Got weights of size", len(weights), "x", len(weights[0]))
-    assert precision > 0
-
-    log_weights_signs = []
-
-    for neuron_weights in weights:
-        neuron_weights_signs = []
-        for weight in neuron_weights:
-            this_log_weights_signs = []
-
-            # Weight which must be added to achieve desired multiplication
-            target_weight = weight
-
-            while abs(target_weight) > precision:
-                exponent = math.ceil(math.log2(abs(target_weight)))
-                negate = target_weight < 0
-                this_weight_contribution = math.pow(2, exponent)
-                target_weight -= (-1 if negate else 1) * this_weight_contribution
-
-                this_log_weights_signs.append(
-                    WeightFragment(exponent=exponent, negative=negate)
-                )
-
-            neuron_weights_signs.append(this_log_weights_signs)
-
-        log_weights_signs.append(neuron_weights_signs)
-
-    #print("Produced denseloglayer of size ", len(log_weights_signs), len(log_weights_signs[0]))
-    return log_weights_signs
 
 def default_converter(model, args):
     if args.log_quantize_all or args.first_layer_log_incremental:
@@ -109,7 +41,7 @@ def default_converter(model, args):
         else:
             layer_log_incremental = False
 
-        layers += convert_layer(layer, log_incremental=layer_log_incremental)
+        layers += convert_layer(layer, weight_log_incremental=layer_log_incremental)
         first_iteration = False
         if auto_relu and not last_iteration:
             layers.append(ReLUStep())
@@ -118,6 +50,7 @@ def default_converter(model, args):
 
 def converter_partial(converter):
     def partial(args):
+        print("parrial")
         # do this late to avoid ridiculous time to show --help
         import torch
         model = torch.jit.load(args.model, map_location='cpu')
@@ -134,7 +67,7 @@ if __name__ == "__main__":
     parser.add_argument("model", help="The input torchfile")
     parser.add_argument("destination", help="Destination .mlgen file")
 
-    subparsers = parser.add_subparsers(dest="converter")
+    subparsers = parser.add_subparsers()
 
     default_parser = subparsers.add_parser("default")
 
@@ -149,7 +82,8 @@ if __name__ == "__main__":
 
     
     
-    parser.parse_args()
+    args = parser.parse_args()
+    args.func(args)
     
 
 # also need to import it here, for global-scope availability for use in module functions
